@@ -154,12 +154,205 @@ app.get('/api/dns/a-record', async (req, res) => {
   }
 });
 
+function validateBatchRecord(record, index) {
+  const errors = [];
+  if (!record.domain) {
+    errors.push(`records[${index}].domain is required`);
+  }
+  if (!record.ip) {
+    errors.push(`records[${index}].ip is required`);
+  } else if (!isValidIP(record.ip)) {
+    errors.push(`records[${index}].ip has invalid IPv4 format`);
+  }
+  return errors;
+}
+
+app.post('/api/dns/a-records/batch', async (req, res) => {
+  const idempotencyKey = req.headers['x-idempotency-key'];
+  const requestHash = generateRequestHash(req.body);
+
+  if (idempotencyKey) {
+    const cached = idempotencyCache.get(idempotencyKey);
+    if (cached && cached.hash === requestHash) {
+      return res.status(200).json({
+        ...cached.response,
+        idempotent: true
+      });
+    }
+  }
+
+  try {
+    const { records } = req.body;
+
+    if (!Array.isArray(records)) {
+      return res.status(400).json({
+        success: false,
+        error: 'records array is required'
+      });
+    }
+
+    if (records.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'records array must not be empty'
+      });
+    }
+
+    if (records.length > 100) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 100 records per batch'
+      });
+    }
+
+    const allErrors = [];
+    records.forEach((record, index) => {
+      const errors = validateBatchRecord(record, index);
+      allErrors.push(...errors);
+    });
+
+    if (allErrors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        errors: allErrors
+      });
+    }
+
+    const result = await dns.batchUpsertARecords(records);
+
+    const responseBody = result;
+
+    if (idempotencyKey) {
+      idempotencyCache.set(idempotencyKey, {
+        hash: requestHash,
+        response: responseBody,
+        expiresAt: Date.now() + IDEMPOTENCY_TTL_MS
+      });
+    }
+
+    const statusCode = result.success ? 200 : 207;
+    res.status(statusCode).json(responseBody);
+
+  } catch (error) {
+    console.error('Error in batch update:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+app.get('/api/dns/a-records/batch', async (req, res) => {
+  try {
+    const { domains } = req.query;
+
+    if (!domains) {
+      return res.status(400).json({
+        success: false,
+        error: 'domains query parameter is required (comma-separated)'
+      });
+    }
+
+    const domainList = domains.split(',').map(d => d.trim()).filter(d => d);
+    
+    if (domainList.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No valid domains provided'
+      });
+    }
+
+    if (domainList.length > 100) {
+      return res.status(400).json({
+        success: false,
+        error: 'Maximum 100 domains per batch query'
+      });
+    }
+
+    const zoneGroups = new Map();
+    
+    for (const fullDomain of domainList) {
+      const parts = normalizeDomain(fullDomain).split('.');
+      if (parts.length < 2) {
+        continue;
+      }
+      const baseDomain = parts.slice(-2).join('.');
+      const subdomain = parts.length > 2 ? parts.slice(0, -2).join('.') : null;
+      
+      if (!zoneGroups.has(baseDomain)) {
+        zoneGroups.set(baseDomain, []);
+      }
+      zoneGroups.get(baseDomain).push({ subdomain, fullDomain: normalizeDomain(fullDomain) });
+    }
+
+    const results = {
+      success: true,
+      total: domainList.length,
+      foundCount: 0,
+      notFoundCount: 0,
+      data: []
+    };
+
+    for (const [baseDomain, group] of zoneGroups.entries()) {
+      try {
+        const zoneId = await dns.getZoneId(baseDomain);
+        const fullDomains = group.map(g => g.fullDomain);
+        const foundRecords = await dns.findMultipleARecords(zoneId, fullDomains);
+
+        for (const { subdomain, fullDomain } of group) {
+          const record = foundRecords.get(fullDomain);
+          if (record) {
+            results.data.push({
+              success: true,
+              fullDomain,
+              type: record.type,
+              ip: record.content,
+              ttl: record.ttl,
+              proxied: record.proxied,
+              recordId: record.id
+            });
+            results.foundCount++;
+          } else {
+            results.data.push({
+              success: false,
+              fullDomain,
+              error: 'A record not found'
+            });
+            results.notFoundCount++;
+          }
+        }
+      } catch (zoneError) {
+        for (const { fullDomain } of group) {
+          results.data.push({
+            success: false,
+            fullDomain,
+            error: zoneError.message
+          });
+          results.notFoundCount++;
+        }
+      }
+    }
+
+    const statusCode = results.foundCount === results.total ? 200 : 207;
+    res.status(statusCode).json(results);
+
+  } catch (error) {
+    console.error('Error in batch query:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 const server = app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
   console.log('API Endpoints:');
   console.log('  GET  /health');
   console.log('  GET  /api/dns/a-record?domain=example.com&subdomain=www');
   console.log('  POST /api/dns/a-record');
+  console.log('  GET  /api/dns/a-records/batch?domains=www.example.com,api.example.com');
+  console.log('  POST /api/dns/a-records/batch');
   console.log('');
   console.log('Idempotency:');
   console.log('  - Add header "X-Idempotency-Key: <unique-key>" to POST requests');
